@@ -77,7 +77,8 @@ fn filter_pytest_output(output: &str) -> String {
         } else if trimmed.starts_with("===")
             && (trimmed.contains("passed")
                 || trimmed.contains("failed")
-                || trimmed.contains("skipped"))
+                || trimmed.contains("skipped")
+                || trimmed.contains("error"))
         {
             summary_line = trimmed.to_string();
             continue;
@@ -88,7 +89,8 @@ fn filter_pytest_output(output: &str) -> String {
             && !trimmed.starts_with("ERROR")
             && (trimmed.contains(" passed")
                 || trimmed.contains(" failed")
-                || trimmed.contains(" skipped"))
+                || trimmed.contains(" skipped")
+                || trimmed.contains(" error"))
             && trimmed.contains(" in ")
         {
             summary_line = trimmed.to_string();
@@ -144,18 +146,24 @@ fn filter_pytest_output(output: &str) -> String {
 
 fn build_pytest_summary(summary: &str, _test_files: &[String], failures: &[String]) -> String {
     // Parse summary line
-    let (passed, failed, skipped) = parse_summary_line(summary);
+    let (passed, failed, skipped, errors) = parse_summary_line(summary);
 
-    if failed == 0 && passed > 0 {
+    if errors == 0 && failed == 0 && passed > 0 {
         return format!("Pytest: {} passed", passed);
     }
 
-    if passed == 0 && failed == 0 && skipped == 0 {
+    if passed == 0 && failed == 0 && skipped == 0 && errors == 0 {
         return "Pytest: No tests collected".to_string();
     }
 
     let mut result = String::new();
-    result.push_str(&format!("Pytest: {} passed, {} failed", passed, failed));
+    result.push_str(&format!(
+        "Pytest: {} passed, {} failed",
+        passed, failed
+    ));
+    if errors > 0 {
+        result.push_str(&format!(", {} error{}", errors, if errors == 1 { "" } else { "s" }));
+    }
     if skipped > 0 {
         result.push_str(&format!(", {} skipped", skipped));
     }
@@ -221,36 +229,45 @@ fn build_pytest_summary(summary: &str, _test_files: &[String], failures: &[Strin
     result.trim().to_string()
 }
 
-fn parse_summary_line(summary: &str) -> (usize, usize, usize) {
+fn parse_summary_line(summary: &str) -> (usize, usize, usize, usize) {
     let mut passed = 0;
     let mut failed = 0;
     let mut skipped = 0;
+    let mut errors = 0;
 
     // Parse lines like "=== 4 passed, 1 failed in 0.50s ==="
+    // or "5 passed, 2 errors in 0.20s"
     let parts: Vec<&str> = summary.split(',').collect();
 
     for part in parts {
         let words: Vec<&str> = part.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             if i > 0 {
-                if word.contains("passed") {
+                // Use ends_with to avoid matching "xpassed" as "passed"
+                // and "xfailed" as "failed"
+                let w = *word;
+                if w.ends_with("passed") && !w.starts_with('x') {
                     if let Ok(n) = words[i - 1].parse::<usize>() {
                         passed = n;
                     }
-                } else if word.contains("failed") {
+                } else if w.contains("failed") && !w.starts_with('x') {
                     if let Ok(n) = words[i - 1].parse::<usize>() {
                         failed = n;
                     }
-                } else if word.contains("skipped") {
+                } else if w.ends_with("skipped") {
                     if let Ok(n) = words[i - 1].parse::<usize>() {
                         skipped = n;
+                    }
+                } else if w.ends_with("error") || w.ends_with("errors") {
+                    if let Ok(n) = words[i - 1].parse::<usize>() {
+                        errors = n;
                     }
                 }
             }
         }
     }
 
-    (passed, failed, skipped)
+    (passed, failed, skipped, errors)
 }
 
 #[cfg(test)]
@@ -338,14 +355,14 @@ collected 0 items
 
     #[test]
     fn test_parse_summary_line() {
-        assert_eq!(parse_summary_line("=== 5 passed in 0.50s ==="), (5, 0, 0));
+        assert_eq!(parse_summary_line("=== 5 passed in 0.50s ==="), (5, 0, 0, 0));
         assert_eq!(
             parse_summary_line("=== 4 passed, 1 failed in 0.50s ==="),
-            (4, 1, 0)
+            (4, 1, 0, 0)
         );
         assert_eq!(
             parse_summary_line("=== 3 passed, 1 failed, 2 skipped in 1.0s ==="),
-            (3, 1, 2)
+            (3, 1, 2, 0)
         );
     }
 
@@ -382,6 +399,29 @@ FAILED tests/test_foo.py::test_something - AssertionError
     }
 
     #[test]
+    fn test_filter_pytest_with_errors() {
+        // Collection errors should report errors, not "No tests collected"
+        let output = r#"=== test session starts ===
+collected 0 items / 1 error
+=== short test summary info ===
+ERROR tests/test_foo.py
+=============================== 1 error in 0.10s ===============================
+"#;
+
+        let result = filter_pytest_output(output);
+        assert!(
+            !result.contains("No tests collected"),
+            "Should not say 'No tests collected' when errors occurred. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("1 error"),
+            "Should show error count. Got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_filter_pytest_only_skipped() {
         // If only skipped tests, should NOT say "No tests collected"
         let output = r#"=== test session starts ===
@@ -394,6 +434,47 @@ collected 3 items
             !result.contains("No tests collected"),
             "Should not say 'No tests collected' when tests were skipped. Got: {}",
             result
+        );
+    }
+
+    #[test]
+    fn test_filter_pytest_mixed_errors() {
+        // 5 passed, 2 errors — errors should be reported
+        let output = r#"=== test session starts ===
+collected 7 items
+tests/test_foo.py .....E.
+=== short test summary info ===
+ERROR tests/test_foo.py::test_error - ImportError
+5 passed, 2 errors in 0.50s
+"#;
+
+        let result = filter_pytest_output(output);
+        assert!(
+            result.contains("5 passed") && result.contains("2 error"),
+            "Should show both passed and error counts. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_parse_summary_line_with_xpass_xfail() {
+        // xpassed and xfailed must NOT be counted as passed/failed
+        assert_eq!(
+            parse_summary_line("4 passed, 1 xfailed, 1 xpassed in 0.50s"),
+            (4, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_summary_line("2 passed, 3 xfailed, 2 xpassed, 1 skipped in 1.00s"),
+            (2, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn test_parse_summary_line_plural_errors() {
+        // "errors" (plural) should also be counted
+        assert_eq!(
+            parse_summary_line("2 errors in 0.10s"),
+            (0, 0, 0, 2)
         );
     }
 }
