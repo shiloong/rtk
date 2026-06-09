@@ -30,7 +30,15 @@ pub fn run(
 
     let mut rg_cmd = resolved_command("rg");
     rg_cmd
-        .args(["-n", "--no-heading", &rg_pattern, path])
+        .args([
+            "-n",
+            "--no-heading",
+            "--with-filename",
+            "--no-column",
+            "--color=never",
+            &rg_pattern,
+            path,
+        ])
         .stdin(Stdio::null());
 
     if let Some(ft) = file_type {
@@ -49,7 +57,7 @@ pub fn run(
         .output()
         .or_else(|_| {
             resolved_command("grep")
-                .args(["-rn", pattern, path])
+                .args(["-rnHE", &rg_pattern, path])
                 .stdin(Stdio::null())
                 .output()
         })
